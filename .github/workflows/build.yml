@@ -1,0 +1,100 @@
+name: Build ZFlip
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main, master ]
+
+jobs:
+  launcher:
+    name: Launcher APK
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Unzip project
+        run: unzip -o ZFlip_Launcher.zip
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+          cache: gradle
+      - name: Accept Android SDK licenses
+        run: |
+          SDKM="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          set +o pipefail
+          yes | "$SDKM" --licenses > /dev/null || true
+      - name: Build APK
+        working-directory: ZFlip_Launcher
+        run: |
+          chmod +x ./gradlew
+          ./gradlew app:assembleDebug --no-daemon
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ZFlip-Launcher-apk
+          path: ZFlip_Launcher/app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
+
+  example-mods:
+    name: Mods de ejemplo (.zflip)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Unzip project
+        run: unzip -o ZFlip_Launcher.zip
+      - name: Build and package
+        working-directory: ZFlip_Launcher/sdk
+        run: |
+          set -e
+          NDK="${ANDROID_NDK_HOME:-$ANDROID_NDK_LATEST_HOME}"
+          rm -rf pkg && mkdir -p pkg
+          for abi in arm64-v8a armeabi-v7a; do
+            cmake -S example-hello -B build/$abi \
+              -DCMAKE_TOOLCHAIN_FILE="$NDK/build/cmake/android.toolchain.cmake" \
+              -DANDROID_ABI=$abi -DANDROID_PLATFORM=android-23 -DANDROID_STL=c++_shared \
+              -DCMAKE_BUILD_TYPE=Release
+            cmake --build build/$abi
+            mkdir -p pkg/lib/$abi
+            cp build/$abi/libmod.so pkg/lib/$abi/mod.so
+          done
+          mkdir -p out
+          cp example-hello/manifest.json pkg/manifest.json
+          (cd pkg && zip -qr ../out/hello.zflip .)
+          # mod de prueba para comprobar el aviso de "no compatible" (declara otra versión de GD)
+          sed 's/"hello"/"old-test"/; s/"Mini Mod Menu"/"Prueba versión antigua"/; s/"gd": \[.*\]/"gd": ["2.2074"]/' example-hello/manifest.json > pkg/manifest.json
+          (cd pkg && zip -qr ../out/old-version-test.zflip .)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ZFlip-example-mods
+          path: ZFlip_Launcher/sdk/out/*.zflip
+          if-no-files-found: error
+
+  nongs-mod:
+    name: Mod NONGs (.zflip)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Unzip project
+        run: unzip -o ZFlip_Launcher.zip
+      - name: Build and package
+        working-directory: ZFlip_Launcher/sdk
+        run: |
+          set -e
+          NDK="${ANDROID_NDK_HOME:-$ANDROID_NDK_LATEST_HOME}"
+          rm -rf pkg-nongs && mkdir -p pkg-nongs out
+          for abi in arm64-v8a armeabi-v7a; do
+            cmake -S nongs -B build-nongs/$abi \
+              -DCMAKE_TOOLCHAIN_FILE="$NDK/build/cmake/android.toolchain.cmake" \
+              -DANDROID_ABI=$abi -DANDROID_PLATFORM=android-23 -DANDROID_STL=c++_shared \
+              -DCMAKE_BUILD_TYPE=Release
+            cmake --build build-nongs/$abi
+            mkdir -p pkg-nongs/lib/$abi
+            cp build-nongs/$abi/libmod.so pkg-nongs/lib/$abi/mod.so
+          done
+          cp nongs/manifest.json pkg-nongs/manifest.json
+          (cd pkg-nongs && zip -qr ../out/nongs.zflip .)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ZFlip-nongs-mod
+          path: ZFlip_Launcher/sdk/out/nongs.zflip
+          if-no-files-found: error
+          
