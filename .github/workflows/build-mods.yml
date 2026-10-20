@@ -1,0 +1,98 @@
+name: Build mods (.zflip)
+
+# Compila SOLO mods. No toca el launcher: el APK que ya tienes instalado sigue valiendo.
+# Cada carpeta mods/<nombre>/ con manifest.json + CMakeLists.txt produce <id>.zflip
+# (arm64-v8a + armeabi-v7a). Para un mod nuevo basta con añadir otra carpeta
+# O subir un .zip al repo (en cualquier ruta): el workflow lo descomprime solo.
+#
+# Formatos de zip aceptados:
+#   1) Con la estructura del repo:  mods/<nombre>/{manifest.json,CMakeLists.txt,src/...}
+#      (y opcionalmente mods/include/zflip.h)
+#   2) Un mod suelto: <nombre>/ o raiz con manifest.json + CMakeLists.txt + src/...
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main, master ]
+    paths: [ 'mods/**', '**.zip', '.github/workflows/build-mods.yml' ]
+
+jobs:
+  mods:
+    name: Mods (.zflip)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Descomprimir .zip del repo en mods/
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p mods
+          mapfile -t zips < <(find . -type f -iname '*.zip' -not -path './.git/*' -not -path './build/*' -not -path './out/*' | sort)
+          if [ "${#zips[@]}" -eq 0 ]; then
+            echo "No hay .zip en el repo; se usan solo las carpetas de mods/"
+            exit 0
+          fi
+          for z in "${zips[@]}"; do
+            echo "::group::Descomprimiendo $z"
+            tmp="$(mktemp -d)"
+            unzip -q -o "$z" -d "$tmp" -x '__MACOSX/*' '.github/*' '.git/*'
+            if [ -d "$tmp/mods" ]; then
+              # Zip con la estructura del repo (mods/...)
+              cp -a "$tmp/mods/." mods/
+            else
+              # Mod(s) sueltos: buscar manifest.json + CMakeLists.txt (max 2 niveles)
+              n=0
+              while IFS= read -r m; do
+                d="$(dirname "$m")"
+                [ -f "$d/CMakeLists.txt" ] || continue
+                id="$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['id'])" "$m")"
+                mkdir -p "mods/$id"
+                cp -a "$d/." "mods/$id/"
+                echo "mod '$id' <- $z"
+                n=$((n+1))
+              done < <(find "$tmp" -maxdepth 3 -name manifest.json)
+              [ "$n" -gt 0 ] || echo "::warning::$z no contiene ningun mod valido (manifest.json + CMakeLists.txt)"
+            fi
+            rm -rf "$tmp"
+            echo "::endgroup::"
+          done
+          echo "Mods disponibles:"; ls -1 mods
+
+      - name: Compilar y empaquetar cada mod
+        shell: bash
+        run: |
+          set -euo pipefail
+          NDK="${ANDROID_NDK_HOME:-${ANDROID_NDK_LATEST_HOME:-}}"
+          test -n "$NDK" || { echo "No se encontro el NDK de Android"; exit 1; }
+          mkdir -p out
+          found=0
+          for dir in mods/*/; do
+            dir="${dir%/}"
+            [ -f "$dir/manifest.json" ] && [ -f "$dir/CMakeLists.txt" ] || continue
+            found=1
+            id="$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['id'])" "$dir/manifest.json")"
+            echo "::group::$id"
+            pkg="build/pkg-$id"
+            rm -rf "$pkg" && mkdir -p "$pkg"
+            for abi in arm64-v8a armeabi-v7a; do
+              cmake -S "$dir" -B "build/$id/$abi" \
+                -DCMAKE_TOOLCHAIN_FILE="$NDK/build/cmake/android.toolchain.cmake" \
+                -DANDROID_ABI="$abi" -DANDROID_PLATFORM=android-23 -DANDROID_STL=c++_shared \
+                -DCMAKE_BUILD_TYPE=Release
+              cmake --build "build/$id/$abi"
+              mkdir -p "$pkg/lib/$abi"
+              cp "build/$id/$abi/libmod.so" "$pkg/lib/$abi/mod.so"
+            done
+            cp "$dir/manifest.json" "$pkg/manifest.json"
+            (cd "$pkg" && zip -qr "$GITHUB_WORKSPACE/out/$id.zflip" .)
+            echo "::endgroup::"
+          done
+          [ "$found" = 1 ] || { echo "No hay mods en mods/*/"; exit 1; }
+          ls -la out
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zflip-mods
+          path: out/*.zflip
+          if-no-files-found: error
+          
