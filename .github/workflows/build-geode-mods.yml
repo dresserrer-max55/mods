@@ -1,0 +1,198 @@
+name: Build Geode (loader + mod) para GD 2.2091
+
+# Recompila DESDE EL CODIGO FUENTE, para Android y GD 2.2091:
+#   1) el loader de Geode  -> Geode.android64.so / Geode.android32.so
+#   2) un mod de Geode (por defecto Globed) contra ese loader -> <mod>.geode
+#
+# Por que recompilar: el binario de un mod .geode viejo esta enlazado contra los bindings de la version
+# de GD para la que se compilo. Compilarlo otra vez con los bindings de 2.2091 es lo unico estable.
+#
+# Uso: Actions -> "Build Geode (loader + mod) para GD 2.2091" -> Run workflow.
+# Puedes cambiar el repo/rama del mod (cualquier mod de Geode con codigo fuente publico).
+
+on:
+  workflow_dispatch:
+    inputs:
+      mod_repo:
+        description: 'Repo del mod (owner/repo)'
+        default: 'GlobedGD/globed2'
+      mod_ref:
+        description: 'Rama, tag o commit del mod (vacio = rama por defecto)'
+        default: ''
+      geode_ref:
+        description: 'Rama, tag o commit de geode-sdk/geode'
+        default: 'main'
+      gd_version:
+        description: 'Version de GD objetivo'
+        default: '2.2091'
+      mod_configure_args:
+        description: 'Argumentos extra de CMake para el mod'
+        default: '-DGLOBED_RELEASE=ON'
+
+env:
+  CPM_SOURCE_CACHE: ${{ github.workspace }}/cpm-cache
+  GD_VERSION: ${{ inputs.gd_version }}
+
+jobs:
+  loader:
+    name: Loader Geode (${{ matrix.id }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { id: android64, abi: arm64-v8a }
+          - { id: android32, abi: armeabi-v7a }
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: geode-sdk/geode
+          ref: ${{ inputs.geode_ref }}
+          submodules: recursive
+
+      # El loader de Android solo conoce los codigos de version hasta 41 (2.2081); sin esto devolveria "43"
+      # en vez de "2.2091" en las peticiones al servidor de mods. Se anaden 42 y 43.
+      - name: Reconocer los codigos de version 42/43 de GD
+        shell: bash
+        run: |
+          f=loader/src/platform/android/LoaderImpl.cpp
+          grep -q 'case 41:' "$f" || { echo "No se encontro 'case 41:' en $f"; exit 1; }
+          sed -i 's|^\( *\)case 41: m_gdVersion = "2.2081"; break;|&\n\1case 42: m_gdVersion = "2.209"; break;\n\1case 43: m_gdVersion = "2.2091"; break;|' "$f"
+          grep -n 'case 4[0-9]' "$f"
+
+      - name: Instalar Ninja
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq ninja-build
+
+      - uses: geode-sdk/cli/.github/actions/setup@main
+
+      - uses: actions/cache@v4
+        with:
+          path: cpm-cache
+          key: cpm-loader-${{ matrix.id }}-${{ hashFiles('**/CMakeLists.txt', '**/*.cmake') }}
+          restore-keys: cpm-loader-${{ matrix.id }}-
+
+      - name: Configurar (GD ${{ inputs.gd_version }})
+        shell: bash
+        run: |
+          set -euo pipefail
+          COMP="${GD_VERSION//./}"
+          NDK=/usr/local/lib/android/sdk/ndk/29.0.14206865
+          [ -d "$NDK" ] || NDK="${ANDROID_NDK_LATEST_HOME:-$ANDROID_NDK_HOME}"
+          cmake -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DGEODE_CODEGEN_CMAKE_ARGS="-DCMAKE_C_COMPILER=clang;-DCMAKE_CXX_COMPILER=clang++;-G Ninja" \
+            -DCMAKE_TOOLCHAIN_FILE="$NDK/build/cmake/android.toolchain.cmake" \
+            -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ \
+            -DANDROID_PLATFORM=android-23 -DANDROID_STL=c++_shared \
+            -DANDROID_ABI=${{ matrix.abi }} \
+            -DCMAKE_INTERPROCEDURAL_OPTIMIZATION=ON \
+            -DGEODE_GD_VERSION="$GD_VERSION" -DGEODE_COMP_GD_VERSION="$COMP"
+          echo "NDK=$NDK" >> "$GITHUB_ENV"
+
+      - name: Compilar
+        run: cmake --build build --parallel
+
+      - name: Quitar simbolos
+        shell: bash
+        run: |
+          f=./bin/nightly/Geode.${{ matrix.id }}.so
+          test -f "$f" || { echo "No se genero $f"; find bin -type f | head; exit 1; }
+          "$NDK"/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip "$f"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: geode-loader-${{ matrix.id }}
+          path: |
+            ./bin/nightly/Geode.${{ matrix.id }}.so
+            ./bin/nightly/resources
+          if-no-files-found: error
+
+  mod:
+    name: Mod (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [ Android64, Android32 ]
+    steps:
+      - name: Checkout del mod
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.mod_repo }}
+          ref: ${{ inputs.mod_ref }}
+          submodules: recursive
+
+      - name: Apuntar mod.json a GD ${{ inputs.gd_version }}
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import os, re, sys
+          v = os.environ["GD_VERSION"]
+          done = False
+          for name in ("mod.json", "mod.json.template"):
+              if not os.path.isfile(name):
+                  continue
+              s = open(name, encoding="utf-8").read()
+              def fix(m):
+                  body = m.group(2)
+                  if body.lstrip().startswith("{"):
+                      body = re.sub(r'("android(?:32|64)?"\s*:\s*)"[^"]*"', r'\1"%s"' % v, body)
+                  else:
+                      body = '"%s"' % v
+                  return m.group(1) + body
+              n = re.sub(r'("gd"\s*:\s*)(\{[^}]*\}|"[^"]*")', fix, s, count=1)
+              open(name, "w", encoding="utf-8").write(n)
+              print(name, "->", re.search(r'"gd"\s*:\s*(\{[^}]*\}|"[^"]*")', n).group(1))
+              done = True
+          if not done:
+              sys.exit("No hay mod.json ni mod.json.template en la raiz del repo del mod")
+          PY
+
+      - name: Calcular version comparable
+        shell: bash
+        run: echo "GD_COMP=${GD_VERSION//./}" >> "$GITHUB_ENV"
+
+      - name: Compilar el mod
+        uses: geode-sdk/build-geode-mod@main
+        with:
+          sdk: nightly
+          target: ${{ matrix.target }}
+          combine: true
+          configure-args: >-
+            -DGEODE_GD_VERSION=${{ env.GD_VERSION }}
+            -DGEODE_COMP_GD_VERSION=${{ env.GD_COMP }}
+            ${{ inputs.mod_configure_args }}
+          ccache-variant: sccache
+
+  package:
+    name: Empaquetar
+    runs-on: ubuntu-latest
+    needs: [ loader, mod ]
+    steps:
+      - name: Unir .geode de todas las plataformas
+        id: combine
+        uses: geode-sdk/build-geode-mod/combine@main
+        with:
+          zstd: false
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: geode-loader-*
+          path: loader
+          merge-multiple: true
+
+      - name: Reunir salida
+        shell: bash
+        run: |
+          mkdir -p final
+          cp "${{ steps.combine.outputs.build-output }}"/*.geode final/
+          cp loader/*.so final/
+          # recursos del loader (archivos sueltos); el Launcher los instala con "Añadir mod"
+          (cd loader/resources && zip -qr ../../final/resources.zip .)
+          ls -la final
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: geode-2.2091-build
+          path: final/*
+          if-no-files-found: error
