@@ -24,8 +24,8 @@ on:
         description: 'Rama, tag o commit del mod (vacio = rama por defecto)'
         default: ''
       geode_ref:
-        description: 'Rama, tag o commit de geode-sdk/geode'
-        default: 'main'
+        description: 'Rama, tag o commit de geode-sdk/geode (v6 = adaptada a GD 2.2091; main sigue en 2.2081)'
+        default: 'v6'
       gd_version:
         description: 'Version de GD objetivo'
         default: '2.2091'
@@ -51,7 +51,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: geode-sdk/geode
-          ref: ${{ inputs.geode_ref || 'main' }}
+          ref: ${{ inputs.geode_ref || 'v6' }}
           submodules: recursive
 
       # El loader de Android solo conoce los codigos de version hasta 41 (2.2081); sin esto devolveria "43"
@@ -93,8 +93,32 @@ jobs:
             -DGEODE_GD_VERSION="$GD_VERSION" -DGEODE_COMP_GD_VERSION="$COMP"
           echo "NDK=$NDK" >> "$GITHUB_ENV"
 
+      # El log de GitHub se corta y el error real queda al final. Aqui se guarda todo en build.log,
+      # se resumen los errores en el "Summary" de la ejecucion y se sube build.log como artefacto.
       - name: Compilar
-        run: cmake --build build --parallel
+        shell: bash
+        run: |
+          set +e
+          cmake --build build --parallel 2>&1 | tee build.log
+          code=${PIPESTATUS[0]}
+          if [ "$code" -ne 0 ]; then
+            {
+              echo "## Error compilando el loader (${{ matrix.id }})"
+              echo '```'
+              grep -n -B1 -A14 -E 'FAILED:|error:|undefined reference|ld: error|fatal error' build.log | head -150
+              echo '```'
+            } | tee -a "$GITHUB_STEP_SUMMARY"
+            echo "::error title=Loader ${{ matrix.id }}::fallo la compilacion; mira el Summary o el artefacto build-log-${{ matrix.id }}"
+          fi
+          exit $code
+
+      - name: Subir build.log
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log-${{ matrix.id }}
+          path: build.log
+          if-no-files-found: ignore
 
       - name: Quitar simbolos
         shell: bash
@@ -114,10 +138,13 @@ jobs:
   mod:
     name: Mod (${{ matrix.target }})
     runs-on: ubuntu-latest
+    needs: loader
     strategy:
       fail-fast: false
       matrix:
-        target: [ Android64, Android32 ]
+        include:
+          - { target: Android64, id: android64, abi: arm64-v8a }
+          - { target: Android32, id: android32, abi: armeabi-v7a }
     steps:
       - name: Checkout del mod
         uses: actions/checkout@v4
@@ -152,21 +179,91 @@ jobs:
               sys.exit("No hay mod.json ni mod.json.template en la raiz del repo del mod")
           PY
 
-      - name: Calcular version comparable
+      # SDK de Geode: la MISMA rama que el loader (v6). El action oficial build-geode-mod no acepta una rama,
+      # por eso el mod se compila a mano con los mismos pasos que hace ese action.
+      - name: Checkout del SDK de Geode
+        uses: actions/checkout@v4
+        with:
+          repository: geode-sdk/geode
+          ref: ${{ inputs.geode_ref || 'v6' }}
+          submodules: recursive
+          path: geode-sdk-clone
+
+      - name: Loader compilado (para enlazar el mod)
+        uses: actions/download-artifact@v4
+        with:
+          name: geode-loader-${{ matrix.id }}
+          path: geode-sdk-clone/bin/nightly
+
+      - name: Instalar Ninja
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq ninja-build
+
+      - uses: geode-sdk/cli/.github/actions/setup@main
+
+      - uses: actions/cache@v4
+        with:
+          path: cpm-cache
+          key: cpm-mod-${{ matrix.id }}-${{ hashFiles('**/CMakeLists.txt', '**/*.cmake') }}
+          restore-keys: cpm-mod-${{ matrix.id }}-
+
+      - name: Configurar perfil del CLI
         shell: bash
-        run: echo "GD_COMP=${GD_VERSION//./}" >> "$GITHUB_ENV"
+        run: |
+          CLI_PROFILE="$GITHUB_WORKSPACE/cli-profile"
+          mkdir -p "$CLI_PROFILE/geode/mods" "$CLI_PROFILE/Contents/geode/mods"
+          geode profile add --name GithubActions "$CLI_PROFILE/GeometryDash.exe" win
+          echo "GEODE_SDK=$GITHUB_WORKSPACE/geode-sdk-clone" >> "$GITHUB_ENV"
+          echo "GD_COMP=${GD_VERSION//./}" >> "$GITHUB_ENV"
 
       - name: Compilar el mod
-        uses: geode-sdk/build-geode-mod@main
+        shell: bash
+        run: |
+          set +e
+          NDK=/usr/local/lib/android/sdk/ndk/29.0.14206865
+          [ -d "$NDK" ] || NDK="${ANDROID_NDK_LATEST_HOME:-$ANDROID_NDK_HOME}"
+          {
+            cmake -B build -G Ninja \
+              -DCMAKE_BUILD_TYPE=Release \
+              -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ \
+              -DGEODE_CODEGEN_CMAKE_ARGS="-DCMAKE_C_COMPILER=clang;-DCMAKE_CXX_COMPILER=clang++;-G Ninja" \
+              -DCMAKE_TOOLCHAIN_FILE="$NDK/build/cmake/android.toolchain.cmake" \
+              -DANDROID_STL=c++_shared -DANDROID_ABI=${{ matrix.abi }} -DANDROID_PLATFORM=android-23 \
+              -DCMAKE_INTERPROCEDURAL_OPTIMIZATION=ON \
+              -DGEODE_DONT_INSTALL_MODS=ON -DGEODE_TARGET_PLATFORM=${{ matrix.target }} \
+              -DGEODE_GD_VERSION="$GD_VERSION" -DGEODE_COMP_GD_VERSION="$GD_COMP" \
+              ${{ inputs.mod_configure_args || '-DGLOBED_RELEASE=ON' }} \
+            && cmake --build build --parallel
+          } 2>&1 | tee build.log
+          code=${PIPESTATUS[0]}
+          if [ "$code" -ne 0 ]; then
+            {
+              echo "## Error compilando el mod (${{ matrix.target }})"
+              echo '```'
+              grep -n -B1 -A14 -E 'FAILED:|error:|CMake Error|undefined reference|ld: error|fatal error' build.log | head -150
+              echo '```'
+            } | tee -a "$GITHUB_STEP_SUMMARY"
+            echo "::error title=Mod ${{ matrix.target }}::fallo la compilacion; mira el Summary o el artefacto build-log-mod-${{ matrix.id }}"
+            exit $code
+          fi
+          mkdir -p output
+          find build -name '*.geode' -exec cp {} output/ \;
+          ls -la output
+          ls output/*.geode >/dev/null 2>&1 || { echo "No se genero ningun .geode"; exit 1; }
+
+      - name: Subir build.log del mod
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
         with:
-          sdk: nightly
-          target: ${{ matrix.target }}
-          combine: true
-          configure-args: >-
-            -DGEODE_GD_VERSION=${{ env.GD_VERSION }}
-            -DGEODE_COMP_GD_VERSION=${{ env.GD_COMP }}
-            ${{ inputs.mod_configure_args || '-DGLOBED_RELEASE=ON' }}
-          ccache-variant: sccache
+          name: build-log-mod-${{ matrix.id }}
+          path: build.log
+          if-no-files-found: ignore
+
+      # nombre que espera el action "combine"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: geode-build-${{ matrix.id }}
+          path: output/*.geode
+          if-no-files-found: error
 
   package:
     name: Empaquetar
