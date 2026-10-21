@@ -1,100 +1,88 @@
-name: Build ZFlip
+name: Build Jukebox 2.2091 (Android64)
 
 on:
   workflow_dispatch:
   push:
-    branches: [ main, master ]
+    branches:
+      - "**"
+
+env:
+  GD_VERSION: "2.2091"
+  GD_COMP_VERSION: "22091"
+  GEODE_VERSION: "5.11.2"
+  # commit de los bindings que ya tiene 2.2091 pero es anterior al cambio que rompe el SDK 5.11.2
+  BINDINGS_REF: "4dfba181"
 
 jobs:
-  launcher:
-    name: Launcher APK
+  build:
+    name: Android64
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - name: Unzip project
-        run: unzip -o ZFlip_Launcher.zip
-      - uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: 21
-          cache: gradle
-      - name: Accept Android SDK licenses
-        run: |
-          SDKM="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
-          set +o pipefail
-          yes | "$SDKM" --licenses > /dev/null || true
-      - name: Build APK
-        working-directory: ZFlip_Launcher
-        run: |
-          chmod +x ./gradlew
-          ./gradlew app:assembleDebug --no-daemon
-      - uses: actions/upload-artifact@v4
-        with:
-          name: ZFlip-Launcher-apk
-          path: ZFlip_Launcher/app/build/outputs/apk/debug/*.apk
-          if-no-files-found: error
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-  example-mods:
-    name: Mods de ejemplo (.zflip)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
       - name: Unzip project
-        run: unzip -o ZFlip_Launcher.zip
-      - name: Build and package
-        working-directory: ZFlip_Launcher/sdk
         run: |
-          set -e
-          NDK="${ANDROID_NDK_HOME:-$ANDROID_NDK_LATEST_HOME}"
-          rm -rf pkg && mkdir -p pkg
-          for abi in arm64-v8a armeabi-v7a; do
-            cmake -S example-hello -B build/$abi \
-              -DCMAKE_TOOLCHAIN_FILE="$NDK/build/cmake/android.toolchain.cmake" \
-              -DANDROID_ABI=$abi -DANDROID_PLATFORM=android-23 -DANDROID_STL=c++_shared \
-              -DCMAKE_BUILD_TYPE=Release
-            cmake --build build/$abi
-            mkdir -p pkg/lib/$abi
-            cp build/$abi/libmod.so pkg/lib/$abi/mod.so
-          done
-          mkdir -p out
-          cp example-hello/manifest.json pkg/manifest.json
-          (cd pkg && zip -qr ../out/hello.zflip .)
-          # mod de prueba para comprobar el aviso de "no compatible" (declara otra versión de GD)
-          sed 's/"hello"/"old-test"/; s/"Mini Mod Menu"/"Prueba versión antigua"/; s/"gd": \[.*\]/"gd": ["2.2074"]/' example-hello/manifest.json > pkg/manifest.json
-          (cd pkg && zip -qr ../out/old-version-test.zflip .)
-      - uses: actions/upload-artifact@v4
-        with:
-          name: ZFlip-example-mods
-          path: ZFlip_Launcher/sdk/out/*.zflip
-          if-no-files-found: error
+          rm -rf jukebox_src
+          mkdir jukebox_src
+          unzip -q -o Jukebox_2.2091.zip -d jukebox_src
+          test -f jukebox_src/mod.json || (echo "::error::No se encontro mod.json dentro del zip" && exit 1)
 
-  nongs-mod:
-    name: Mod NONGs (.zflip)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Unzip project
-        run: unzip -o ZFlip_Launcher.zip
-      - name: Build and package
-        working-directory: ZFlip_Launcher/sdk
+      - name: Install Ninja
+        run: sudo apt-get update && sudo apt-get install -y ninja-build
+
+      - name: Setup Geode CLI
+        uses: geode-sdk/cli/.github/actions/setup@main
+
+      - name: Setup Geode SDK
         run: |
-          set -e
-          NDK="${ANDROID_NDK_HOME:-$ANDROID_NDK_LATEST_HOME}"
-          rm -rf pkg-nongs && mkdir -p pkg-nongs out
-          for abi in arm64-v8a armeabi-v7a; do
-            cmake -S nongs -B build-nongs/$abi \
-              -DCMAKE_TOOLCHAIN_FILE="$NDK/build/cmake/android.toolchain.cmake" \
-              -DANDROID_ABI=$abi -DANDROID_PLATFORM=android-23 -DANDROID_STL=c++_shared \
-              -DCMAKE_BUILD_TYPE=Release
-            cmake --build build-nongs/$abi
-            mkdir -p pkg-nongs/lib/$abi
-            cp build-nongs/$abi/libmod.so pkg-nongs/lib/$abi/mod.so
-          done
-          cp nongs/manifest.json pkg-nongs/manifest.json
-          (cd pkg-nongs && zip -qr ../out/nongs.zflip .)
-      - uses: actions/upload-artifact@v4
+          export CLI_PROFILE="$GITHUB_WORKSPACE/cli-profile"
+          mkdir -p "$CLI_PROFILE/geode/mods"
+          geode profile add --name GithubActions "$CLI_PROFILE/GeometryDash.exe" win
+          geode sdk install "$GITHUB_WORKSPACE/geode-sdk-clone"
+          export GEODE_SDK="$GITHUB_WORKSPACE/geode-sdk-clone"
+          echo "GEODE_SDK=$GEODE_SDK" >> $GITHUB_ENV
+          geode sdk update "$GEODE_VERSION"
+          geode sdk install-binaries --platform android64 --version "$GEODE_VERSION"
+          echo "CPM_SOURCE_CACHE=$GITHUB_WORKSPACE/cpm-cache" >> $GITHUB_ENV
+
+      - name: Download bindings (2.2091)
+        run: |
+          git clone https://github.com/geode-sdk/bindings bindings-repo
+          git -C bindings-repo checkout "$BINDINGS_REF"
+          ls bindings-repo/bindings | tr '\n' ' '
+          test -d bindings-repo/bindings/2.2091 || (echo "::error::Estos bindings no tienen 2.2091" && exit 1)
+          echo "GEODE_BINDINGS_REPO_PATH=$GITHUB_WORKSPACE/bindings-repo" >> $GITHUB_ENV
+
+      - name: Patch SDK headers (scrollWheel bool, como en los bindings 2.2091)
+        run: |
+          H="$GEODE_SDK/loader/include/Geode"
+          sed -i 's/virtual void scrollWheel(float y, float x) {}/virtual bool scrollWheel(float y, float x) { return false; }/' "$H/cocos/robtop/mouse_dispatcher/CCMouseDelegate.h"
+          sed -i 's/void scrollWheel(float y, float\( x\)\?) override;/bool scrollWheel(float y, float x) override;/' "$H/ui/ScrollLayer.hpp" "$H/ui/Scrollbar.hpp"
+          grep -rn "scrollWheel" "$H/cocos/robtop/mouse_dispatcher/CCMouseDelegate.h" "$H/ui/ScrollLayer.hpp" "$H/ui/Scrollbar.hpp"
+
+      - name: Build
+        run: |
+          NDK_PATH=/usr/local/lib/android/sdk/ndk/29.0.14206865
+          if [ ! -d "$NDK_PATH" ]; then NDK_PATH="$ANDROID_NDK_LATEST_HOME"; fi
+          cd jukebox_src
+          cmake -B build -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ \
+            -DGEODE_CODEGEN_CMAKE_ARGS="-DCMAKE_C_COMPILER=clang;-DCMAKE_CXX_COMPILER=clang++;-G Ninja" \
+            -G Ninja \
+            -DCMAKE_TOOLCHAIN_FILE=$NDK_PATH/build/cmake/android.toolchain.cmake \
+            -DANDROID_STL=c++_shared -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-23 \
+            -DCMAKE_INTERPROCEDURAL_OPTIMIZATION=ON \
+            -DGEODE_DONT_INSTALL_MODS=ON -DGEODE_TARGET_PLATFORM=Android64 \
+            -DGEODE_GD_VERSION=$GD_VERSION -DGEODE_COMP_GD_VERSION=$GD_COMP_VERSION
+          cmake --build build --config Release --parallel
+          mkdir -p "$GITHUB_WORKSPACE/output"
+          find ./build -name "*.geode" -exec cp {} "$GITHUB_WORKSPACE/output/" \;
+          ls -la "$GITHUB_WORKSPACE/output"
+
+      - name: Upload .geode
+        uses: actions/upload-artifact@v4
         with:
-          name: ZFlip-nongs-mod
-          path: ZFlip_Launcher/sdk/out/nongs.zflip
-          if-no-files-found: error
+          name: jukebox-android64-2.2091
+          path: output/*.geode
           
